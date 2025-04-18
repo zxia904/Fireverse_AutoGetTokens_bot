@@ -220,10 +220,12 @@ async function getAllTokens() {
 }
 
 class FireverseMusicBot {
-    constructor(token, accountIndex) {
+    constructor(privateKey, accountIndex, inviteCode = "wanfeng") {
         this.baseUrl = API_BASE_URL;
-        this.token = token;
+        this.token = null;
         this.accountIndex = accountIndex;
+        this.privateKey = privateKey;
+        this.inviteCode = inviteCode;
         this.playedSongs = new Set();
         this.dailyPlayCount = 0;
         this.DAILY_LIMIT = 50;
@@ -244,7 +246,7 @@ class FireverseMusicBot {
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-site',
             'sec-gpc': '1',
-            'token': token
+            'token': null
         };
     }
     log(message, overwrite = false) {
@@ -265,6 +267,13 @@ class FireverseMusicBot {
 
     async initialize() {
         try {
+            // 先获取token
+            const tokenSuccess = await this.refreshToken();
+            if (!tokenSuccess) {
+                this.log('❌ 无法获取token，初始化失败');
+                return false;
+            }
+            
             await this.getUserInfo();
             await this.getDailyTasks();
             return true;
@@ -511,6 +520,66 @@ class FireverseMusicBot {
         }
     }
 
+    async refreshToken() {
+        try {
+            this.log('🔄 正在获取token...');
+            
+            if (!this.privateKey) {
+                this.log('❌ 无法获取token：未提供私钥');
+                return false;
+            }
+
+            // 从私钥创建钱包
+            const wallet = new ethers.Wallet(this.privateKey);
+            this.log('📝 钱包地址: ' + wallet.address);
+            
+            const axiosInstance = axios.create({
+                timeout: 30000,
+                headers: DEFAULT_HEADERS
+            });
+            
+            // 获取会话
+            const session = await getSession(axiosInstance);
+            if (!session) {
+                this.log('❌ 获取会话失败');
+                return false;
+            }
+            this.log('✅ 会话ID: ' + session.sessionId);
+            
+            // 获取nonce
+            const nonce = await getNonce(axiosInstance);
+            if (!nonce) {
+                this.log('❌ 获取nonce失败');
+                return false;
+            }
+            this.log('✅ 获取nonce成功');
+            
+            // 签名消息
+            const { message, signature } = await signMessage({ address: wallet.address, privateKey: this.privateKey }, nonce);
+            this.log('✅ 消息签名成功');
+            
+            // 验证钱包
+            const verifyResult = await verifyWallet(axiosInstance, message, signature, this.inviteCode);
+            
+            if (verifyResult?.success) {
+                const newToken = verifyResult.data.token;
+                this.log('🎉 验证成功! 已获取token');
+                
+                // 更新token和headers
+                this.token = newToken;
+                this.headers.token = newToken;
+                
+                return true;
+            } else {
+                this.log('❌ 钱包验证失败');
+                return false;
+            }
+        } catch (error) {
+            this.log('❌ 获取token过程中出错: ' + error.message);
+            return false;
+        }
+    }
+
     async startDailyLoop() {
         while (true) {
             const shouldContinue = await this.playSession();
@@ -525,6 +594,14 @@ class FireverseMusicBot {
                 this.playedSongs.clear();
                 this.totalListeningTime = 0;
                 this.log('\n🔄 开始新的每日会话');
+                
+                // 循环开始前刷新token
+                const tokenRefreshed = await this.refreshToken();
+                if (!tokenRefreshed) {
+                    this.log('⚠️ Token刷新失败，本次循环将被跳过');
+                    continue;
+                }
+                
                 await this.getUserInfo();
                 await this.getDailyTasks();
             } else {
@@ -534,15 +611,24 @@ class FireverseMusicBot {
     }
 }
 
-async function readTokens() {
+async function readPrivateKeys() {
     try {
-        const content = await fs.readFile('tokens.txt', 'utf-8');
-        return content.split('\n')
-            .map(line => line.trim())
-            .filter(line => line && !line.startsWith('#'));
+        // 读取私钥
+        const walletsPath = path.join(__dirname, 'wallets.txt');
+        const privateKeys = [];
+        if (fsSync.existsSync(walletsPath)) {
+            const content = await fs.readFile(walletsPath, 'utf8');
+            privateKeys.push(...content.split('\n')
+                .map(line => line.trim())
+                .filter(line => line && line.startsWith('0x')));
+            return privateKeys;
+        } else {
+            console.error('❌ wallets.txt文件不存在，请创建该文件并添加私钥');
+            return [];
+        }
     } catch (error) {
-        console.error('❌ 读取tokens.txt出错:', error.message);
-        process.exit(1);
+        console.error('❌ 读取wallets.txt出错:', error.message);
+        return [];
     }
 }
 
@@ -550,49 +636,19 @@ async function main() {
     try {
         console.log('🔐 Fireverse自动化工具启动中...');
         
-        // 添加是否更新token的选项
-        const updateToken = await question('是否需要更新Token? (y/n, 默认n): ');
+        // 只读取私钥
+        const privateKeys = await readPrivateKeys();
         
-        let tokenSuccess = true;
-        if (updateToken.toLowerCase() === 'y') {
-            console.log('🔄 开始更新Token...');
-            tokenSuccess = await getAllTokens();
-            
-            if (!tokenSuccess) {
-                console.error('❌ 获取token失败，无法继续执行');
-                process.exit(1);
-            }
-            console.log('✅ Token更新成功，开始运行音乐机器人');
-        } else {
-            console.log('✅ 跳过Token更新，使用现有Token');
-            // 检查tokens.txt是否存在
-            const tokensPath = path.join(__dirname, 'tokens.txt');
-            if (!fsSync.existsSync(tokensPath)) {
-                console.error('❌ tokens.txt文件不存在，请先获取Token');
-                const createNew = await question('是否现在获取Token? (y/n): ');
-                if (createNew.toLowerCase() === 'y') {
-                    tokenSuccess = await getAllTokens();
-                    if (!tokenSuccess) {
-                        console.error('❌ 获取token失败，无法继续执行');
-                        process.exit(1);
-                    }
-                } else {
-                    console.error('❌ 无法继续执行，请先获取Token');
-                    process.exit(1);
-                }
-            }
-        }
-        
-        const tokens = await readTokens();
-        
-        if (tokens.length === 0) {
-            console.error('❌ tokens.txt中没有找到token');
+        if (privateKeys.length === 0) {
+            console.error('❌ wallets.txt中没有找到私钥，无法继续运行');
             process.exit(1);
         }
 
-        console.log(`📱 找到 ${tokens.length} 个账号`);
+        console.log(`🔑 找到 ${privateKeys.length} 个私钥`);
         
-        const bots = tokens.map((token, index) => new FireverseMusicBot(token, index + 1));
+        // 创建机器人实例，只传入私钥
+        const bots = privateKeys.map((privateKey, index) => 
+            new FireverseMusicBot(privateKey, index + 1));
         
         const initResults = await Promise.all(bots.map(bot => bot.initialize()));
         
@@ -602,6 +658,8 @@ async function main() {
             console.error('❌ 没有账号能够成功初始化');
             process.exit(1);
         }
+        
+        console.log(`✅ 成功初始化 ${activeBots.length}/${privateKeys.length} 个账号`);
 
         await Promise.all(activeBots.map(bot => bot.startDailyLoop()));
     } catch (error) {
